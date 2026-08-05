@@ -10,6 +10,11 @@ import holidays
 import optuna
 import logging
 from plotly.subplots import make_subplots
+from optuna.visualization import (
+    plot_optimization_history,
+    plot_param_importances,
+    plot_slice
+)
 
 
 
@@ -30,7 +35,6 @@ class Config:
     last_n_days_profile: int = 60
     use_crossvalidation: bool = False
     use_params_tuning: bool = False
-
 
 
 def load_data(file_path):
@@ -82,6 +86,121 @@ def objective(trial, series, holidays, config):
     _, wape = calculate_metrics(y_true, y_pred)
 
     return wape
+
+
+def plot_wape_history(study, ts_name, output_dir):
+    """Построение графика изменения WAPE в процессе оптимизации"""
+
+    if study is None:
+        return
+
+    # Получаем историю trials
+    trials_df = study.trials_dataframe()
+
+    if len(trials_df) == 0:
+        return
+
+    # Фильтруем только завершенные trials
+    complete_trials = trials_df[trials_df['state'] == 'COMPLETE']
+
+    if len(complete_trials) == 0:
+        return
+
+    # Создаем график
+    fig = go.Figure()
+
+    # График значений WAPE по trials (точки)
+    fig.add_trace(
+        go.Scatter(
+            x=complete_trials['number'],
+            y=complete_trials['value'],
+            mode='markers',
+            name='WAPE value',
+            marker=dict(
+                size=10,
+                color='blue',
+                opacity=0.6
+            ),
+            text=[f"Trial {i}<br>WAPE: {wape:.2f}%" for i, wape in
+                  zip(complete_trials['number'], complete_trials['value'])],
+            hoverinfo='text'
+        )
+    )
+
+    # Линия, соединяющая точки
+    fig.add_trace(
+        go.Scatter(
+            x=complete_trials['number'],
+            y=complete_trials['value'],
+            mode='lines',
+            name='WAPE trend',
+            line=dict(color='blue', width=1, dash='solid'),
+            showlegend=True
+        )
+    )
+
+    # Лучшее значение на данный момент (кумулятивный минимум)
+    best_values = complete_trials['value'].cummin()
+    fig.add_trace(
+        go.Scatter(
+            x=complete_trials['number'],
+            y=best_values,
+            mode='lines',
+            name='Best WAPE so far',
+            line=dict(color='red', width=2, dash='dash')
+        )
+    )
+
+    # Отмечаем лучший trial
+    best_trial_idx = complete_trials['value'].idxmin()
+    best_trial = complete_trials.loc[best_trial_idx]
+    best_wape = best_trial['value']
+    best_number = best_trial['number']
+
+    fig.add_trace(
+        go.Scatter(
+            x=[best_number],
+            y=[best_wape],
+            mode='markers',
+            name=f'Best trial (WAPE: {best_wape:.2f}%)',
+            marker=dict(
+                size=15,
+                color='red',
+                symbol='star',
+                line=dict(color='black', width=1)
+            )
+        )
+    )
+
+    # Настройка оформления
+    fig.update_layout(
+        title=dict(
+            text=f"WAPE Optimization History - {ts_name}<br><sub>Best WAPE: {best_wape:.2f}% | Total trials: {len(complete_trials)}</sub>",
+            font=dict(size=14)
+        ),
+        xaxis=dict(
+            title="Trial Number",
+            showgrid=True,
+            gridwidth=1,
+            gridcolor='lightgray'
+        ),
+        yaxis=dict(
+            title="WAPE (%)",
+            showgrid=True,
+            gridwidth=1,
+            gridcolor='lightgray'
+        ),
+        hovermode='closest',
+        plot_bgcolor='white',
+        height=500,
+        width=900
+    )
+
+    # Сохраняем график
+    plot_path = os.path.join(output_dir, f"{ts_name}_wape_history.html")
+    fig.write_html(plot_path)
+    logger.info(f"Saved WAPE history plot: {plot_path}")
+
 
 
 def preprocess(df, config: Config):
@@ -146,68 +265,64 @@ def preprocess(df, config: Config):
 
 
 
-def forecast_daily(series_daily, holidays_train, future_holidays, config: Config):
-
+def forecast_daily(series_daily, holidays_train, future_holidays, config: Config, ts_name, output_dir):
     best_params = {}
-
+    study = None
     if config.use_params_tuning:
         study = optuna.create_study(direction="minimize")
-
+        def log_trial(study, trial):
+            logger.info(f"Trial {trial.number}: WAPE = {trial.value:.4f}% | "
+                        f"Params: {trial.params}")
         study.optimize(
             lambda trial: objective(trial, series_daily, holidays_train, config),
-            n_trials=20
+            n_trials=20,
+            callbacks=[log_trial],
         )
-
         best_params = study.best_params
+        logger.info(f"Best params for {ts_name}: {best_params} | Best WAPE: {study.best_value:.4f}%")
+        wape_plot_dir = os.path.join(output_dir, "wape_analysis")
+        os.makedirs(wape_plot_dir, exist_ok=True)
+        plot_wape_history(study, ts_name, wape_plot_dir)
     else:
         best_params = {}
-
     model = Prophet(
         yearly_seasonality=True,
         weekly_seasonality=True,
         **best_params
     )
-
     if config.use_crossvalidation:
         score = cross_validate(series_daily, holidays_train, config)
         logger.info(f"CV WAPE: {score}")
 
     model.fit(series_daily, future_covariates=holidays_train)
-
+    metrics = {
+        "cv_wape": score if config.use_crossvalidation else None,
+        "best_wape": study.best_value if study else None
+    }
     return model.predict(
         n=config.steps_days,
         future_covariates=future_holidays
-    ), best_params
+    ), best_params, metrics, study
 
 
 def disaggregate_to_intraday(fcst_daily, profile, start_time, steps_days):
-
     df_fcst_daily = pd.DataFrame({
         'date': pd.to_datetime(fcst_daily.time_index.date),
         'y_daily': fcst_daily.values().flatten()
     })
-
     future_index = pd.date_range(
         start=start_time,
         periods=steps_days * 48,
         freq='30min'
     )
-
     fcst_30 = pd.DataFrame({'dttm_30': future_index})
     fcst_30['date'] = fcst_30['dttm_30'].dt.floor('D')
     fcst_30['time'] = fcst_30['dttm_30'].dt.time
     fcst_30['is_weekend'] = fcst_30['dttm_30'].dt.weekday >= 5
-
-
     fcst_30 = fcst_30.merge(df_fcst_daily, on='date', how='left')
-
-
     fcst_30 = fcst_30.merge(profile, on=['is_weekend', 'time'], how='left')
-
-
     fcst_30['forecast'] = fcst_30['y_daily'] * fcst_30['share']
     fcst_30['forecast'] = fcst_30['forecast'].clip(lower=0)
-
     return fcst_30[['dttm_30', 'forecast']]
 
 
@@ -281,7 +396,6 @@ def get_new_year_profile(df):
 
 
 def apply_new_year_adjustment(fcst_df, ny_profile):
-
     fcst_df = fcst_df.copy()
 
     fcst_df['date'] = pd.to_datetime(fcst_df['dttm_30']).dt.date
@@ -382,12 +496,13 @@ def cross_validate(series, holidays, config: Config):
 
     return np.mean(errors)
 
-def run_forecast(df, holiday_series, get_intraday_profile, aggregate_to_daily, config):
+def run_forecast(df, holiday_series, get_intraday_profile, aggregate_to_daily, config, output_dir):
 
     results = []
+    metrics_rows = []
 
 
-    for ts_name in df['ts_name'].unique():
+    for ts_name in df['ts_name'].unique()[1:3]:
         logger.info(f"Processing TS: {ts_name}")
         ts_df = df[df['ts_name'] == ts_name]
 
@@ -445,12 +560,7 @@ def run_forecast(df, holiday_series, get_intraday_profile, aggregate_to_daily, c
         )
 
 
-        fcst_daily, best_params = forecast_daily(
-            series_daily,
-            holidays_train,
-            future_holidays,
-            config
-        )
+        fcst_daily, best_params, metrics, study = forecast_daily(series_daily, holidays_train, future_holidays, config, ts_name, output_dir)
 
 
         fcst_30 = disaggregate_to_intraday(
@@ -466,7 +576,20 @@ def run_forecast(df, holiday_series, get_intraday_profile, aggregate_to_daily, c
         fcst_30['ts_name'] = ts_name
         results.append(fcst_30)
 
-    return pd.concat(results, ignore_index=True)
+        metrics_rows.append({
+            "ts_name": ts_name,
+            "cv_wape": metrics["cv_wape"],
+            "best_wape": metrics["best_wape"],
+            "best_params": str(best_params)
+        })
+
+    metrics_df = pd.DataFrame(metrics_rows)
+
+    return (
+        pd.concat(results, ignore_index=True),
+        metrics_df
+    )
+
 
 
 
@@ -593,16 +716,18 @@ def main(
 
     df, get_intraday_profile, aggregate_to_daily, holiday_series = preprocess(df, config)
 
-    forecast_df = run_forecast(
+    forecast_df, metrics_df = run_forecast(
         df,
         holiday_series,
         get_intraday_profile,
         aggregate_to_daily,
-        config
+        config,
+        output_dir
     )
 
     save_forecast(forecast_df, output_dir)
     save_plots(df, forecast_df, output_dir)
+
 
 
 if __name__ == "__main__":
