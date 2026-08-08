@@ -211,27 +211,6 @@ python forecast.py \
     --use-params-tuning
 ```
 
-## Структура проекта
-
-```text
-time-series-forecasting/
-│
-├── data/
-│   └── ...
-│
-├── images/
-│   ├── seasonality.png
-│   ├── optuna.png
-│   └── forecast.png
-│
-├── notebooks/
-│   └── seasons_upd.ipynb
-│
-├── forecast.py
-├── requirements.txt
-├── README.md
-└── .gitignore
-```
 
 ## Исследовательский ноутбук
 
